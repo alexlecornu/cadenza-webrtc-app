@@ -4,7 +4,7 @@ const http         = require('http');
 const { PeerServer } = require('peer');
 const bcrypt       = require('bcryptjs');
 const jwt          = require('jsonwebtoken');
-const { v4: uuid } = require('uuid');
+const { randomUUID: uuid } = require('crypto');
 const fs           = require('fs');
 const path         = require('path');
 
