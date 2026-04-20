@@ -10,15 +10,13 @@ const fs       = require('fs');
 const path     = require('path');
 
 const PORT    = process.env.PORT || 3000;
-const SECRET  = process.env.JWT_SECRET || 'nexlink-dev-secret-change-in-production';
+const SECRET  = process.env.JWT_SECRET || 'cadenza-dev-secret-change-in-production';
 const DB_PATH = path.join(__dirname, 'data', 'users.json');
 
 // ── DATA DIR + FRESH DB ───────────────────────────────
 const dataDir = path.join(__dirname, 'data');
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-
-// Always start fresh — wipe any existing user data on deploy
-saveDB({ users: [] });
+saveDB({ users: [] }); // Reset on every deploy
 
 function loadDB() {
   try { return JSON.parse(fs.readFileSync(DB_PATH, 'utf8')); }
@@ -28,37 +26,43 @@ function saveDB(db) { fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2)); }
 function findUser(email) { return loadDB().users.find(u => u.email.toLowerCase() === email.toLowerCase()); }
 function sanitize(u) { const { password, ...safe } = u; return safe; }
 
-// ── PASSWORD STRENGTH ─────────────────────────────────
-function strongPassword(pw) {
-  return pw.length >= 8 &&
-    /[A-Z]/.test(pw) &&
-    /[0-9]/.test(pw) &&
-    /[^A-Za-z0-9]/.test(pw);
+// ── ROOM CODE GENERATOR (xxxx-xxxx numeric) ───────────
+function generateRoomCode() {
+  const seg = () => Math.floor(1000 + Math.random() * 9000).toString();
+  return `${seg()}-${seg()}`;
 }
 
-// ── EXPRESS + SERVERS ─────────────────────────────────
+// ── PASSWORD STRENGTH ─────────────────────────────────
+function strongPassword(pw) {
+  return pw.length >= 8 && /[A-Z]/.test(pw) && /[0-9]/.test(pw) && /[^A-Za-z0-9]/.test(pw);
+}
+
+// ── EXPRESS + HTTP ────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: '5mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const server = http.createServer(app);
 
-// PeerJS for WebRTC signalling
+// ── PEERJS (WebRTC signalling) ────────────────────────
 const peerServer = PeerServer({ server, path: '/peerjs', allow_discovery: true });
 peerServer.on('connection', c => console.log(`[peer] +${c.getId()}`));
 peerServer.on('disconnect', c => console.log(`[peer] -${c.getId()}`));
 
-// WebSocket for real-time DMs and contact notifications
+// ── WEBSOCKET (DMs, notifications, call signalling) ───
 const wss = new WebSocketServer({ server, path: '/ws' });
-const onlineUsers = new Map(); // username -> ws
+// username -> ws
+const onlineUsers = new Map();
+// roomCode -> Set of usernames
+const rooms = new Map();
 
-wss.on('connection', (ws, req) => {
+wss.on('connection', ws => {
   let username = null;
 
   ws.on('message', raw => {
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
+    let msg; try { msg = JSON.parse(raw); } catch { return; }
 
+    // ── AUTH ──────────────────────────────────────────
     if (msg.type === 'auth') {
       try {
         const payload = jwt.verify(msg.token, SECRET);
@@ -68,67 +72,129 @@ wss.on('connection', (ws, req) => {
         username = user.username;
         onlineUsers.set(username, ws);
         ws.send(JSON.stringify({ type: 'authed', username }));
-        console.log(`[ws] ${username} connected`);
       } catch { ws.close(); }
       return;
     }
 
     if (!username) return;
 
+    // ── DM ────────────────────────────────────────────
     if (msg.type === 'dm') {
-      const { to, text, ts, id: msgId } = msg;
-      if (!to || !text) return;
+      const { to, text, ts, id: msgId, mediaType, dataUrl, fileName, fileSize } = msg;
+      if (!to) return;
 
-      // Persist to both users' inboxes
       const db = loadDB();
       const meIdx = db.users.findIndex(u => u.username === username);
       const theirIdx = db.users.findIndex(u => u.username === to);
       if (meIdx === -1 || theirIdx === -1) return;
 
-      const entry = { id: msgId || uuid(), from: username, to, text, ts: ts || Date.now() };
+      const entry = {
+        id: msgId || uuid(), from: username, to,
+        text: text || null, ts: ts || Date.now(),
+        mediaType: mediaType || null,
+        dataUrl: dataUrl || null,
+        fileName: fileName || null,
+        fileSize: fileSize || null
+      };
+
+      // Persist
       db.users[meIdx].messages = db.users[meIdx].messages || [];
       db.users[theirIdx].messages = db.users[theirIdx].messages || [];
       db.users[meIdx].messages.push(entry);
       db.users[theirIdx].messages.push(entry);
-      // Keep last 500 messages per user
       db.users[meIdx].messages = db.users[meIdx].messages.slice(-500);
       db.users[theirIdx].messages = db.users[theirIdx].messages.slice(-500);
       saveDB(db);
 
-      // Deliver to recipient if online
+      // Deliver
       const recipientWs = onlineUsers.get(to);
       if (recipientWs && recipientWs.readyState === 1) {
         recipientWs.send(JSON.stringify({ type: 'dm', ...entry }));
       }
-      // Echo back to sender
+      // Echo back (single echo, no duplicate)
       ws.send(JSON.stringify({ type: 'dm-sent', ...entry }));
+      return;
     }
 
-    if (msg.type === 'contact-request') {
-      const { to } = msg;
-      const db = loadDB();
-      const meIdx = db.users.findIndex(u => u.username === username);
-      const theirIdx = db.users.findIndex(u => u.username === to);
-      if (meIdx === -1 || theirIdx === -1) return;
+    // ── CALL ROOM SIGNALLING (WebSocket-based, replaces PeerJS room trick) ──
+    if (msg.type === 'call-join') {
+      const { roomCode, peerId, displayName, color, avatar, availability } = msg;
+      if (!roomCode || !peerId) return;
 
-      // Notify recipient if online
-      const recipientWs = onlineUsers.get(to);
-      if (recipientWs && recipientWs.readyState === 1) {
-        recipientWs.send(JSON.stringify({
-          type: 'contact-request',
-          from: username,
-          displayName: db.users[meIdx].displayName,
-          avatar: db.users[meIdx].avatar,
-          color: db.users[meIdx].color
-        }));
+      if (!rooms.has(roomCode)) rooms.set(roomCode, new Map());
+      const room = rooms.get(roomCode);
+
+      // Tell the new joiner about everyone already in the room
+      const existingPeers = [];
+      for (const [u, info] of room) {
+        if (u !== username) existingPeers.push(info);
       }
+      ws.send(JSON.stringify({ type: 'call-peers', roomCode, peers: existingPeers }));
+
+      // Tell everyone in the room about the new joiner
+      const newPeerInfo = { username, peerId, displayName, color, avatar, availability };
+      for (const [u, info] of room) {
+        const peerWs = onlineUsers.get(u);
+        if (peerWs && peerWs.readyState === 1) {
+          peerWs.send(JSON.stringify({ type: 'call-peer-joined', roomCode, peer: newPeerInfo }));
+        }
+      }
+
+      room.set(username, newPeerInfo);
+      return;
+    }
+
+    if (msg.type === 'call-leave') {
+      const { roomCode } = msg;
+      if (!roomCode || !rooms.has(roomCode)) return;
+      const room = rooms.get(roomCode);
+      room.delete(username);
+      for (const [u] of room) {
+        const peerWs = onlineUsers.get(u);
+        if (peerWs && peerWs.readyState === 1) {
+          peerWs.send(JSON.stringify({ type: 'call-peer-left', roomCode, username }));
+        }
+      }
+      if (room.size === 0) rooms.delete(roomCode);
+      return;
+    }
+
+    // ── STATUS UPDATE ─────────────────────────────────
+    if (msg.type === 'status-update') {
+      const { availability } = msg;
+      const db = loadDB();
+      const idx = db.users.findIndex(u => u.username === username);
+      if (idx !== -1) { db.users[idx].availability = availability; saveDB(db); }
+      // Broadcast to all contacts
+      const user = db.users[idx];
+      (user?.contacts || []).forEach(c => {
+        const cWs = onlineUsers.get(c.username);
+        if (cWs && cWs.readyState === 1) {
+          cWs.send(JSON.stringify({ type: 'contact-status', username, availability }));
+        }
+      });
+      return;
     }
   });
 
   ws.on('close', () => {
-    if (username) { onlineUsers.delete(username); console.log(`[ws] ${username} disconnected`); }
+    if (username) {
+      onlineUsers.delete(username);
+      // Remove from all rooms
+      for (const [roomCode, room] of rooms) {
+        if (room.has(username)) {
+          room.delete(username);
+          for (const [u] of room) {
+            const peerWs = onlineUsers.get(u);
+            if (peerWs && peerWs.readyState === 1) {
+              peerWs.send(JSON.stringify({ type: 'call-peer-left', roomCode, username }));
+            }
+          }
+          if (room.size === 0) rooms.delete(roomCode);
+        }
+      }
+    }
   });
-
   ws.on('error', () => {});
 });
 
@@ -141,10 +207,9 @@ function requireAuth(req, res, next) {
 
 // ── REGISTER ──────────────────────────────────────────
 app.post('/api/register', async (req, res) => {
-  const { email, password, displayName, username, color, status } = req.body;
+  const { email, password, displayName, username, color, role } = req.body;
   if (!email || !password || !displayName || !username)
     return res.status(400).json({ error: 'All fields required' });
-
   if (!strongPassword(password))
     return res.status(400).json({ error: 'Password must be at least 8 characters and include an uppercase letter, a number, and a special character' });
 
@@ -154,12 +219,15 @@ app.post('/api/register', async (req, res) => {
   if (db.users.find(u => u.username.toLowerCase() === username.toLowerCase()))
     return res.status(400).json({ error: 'Username already taken — please choose another' });
 
+  const roomCode = generateRoomCode();
   const user = {
     id: uuid(), email: email.toLowerCase(),
     password: await bcrypt.hash(password, 10),
     displayName, username: username.toLowerCase(),
-    color: color || '#3b82f6', status: status || 'Available',
-    avatar: null, contacts: [], contactRequests: [], messages: [],
+    color: color || '#6366f1', role: role || 'student',
+    availability: 'available', avatar: null,
+    roomCode,
+    contacts: [], contactRequests: [], sentRequests: [], messages: [],
     recents: [], createdAt: Date.now()
   };
   db.users.push(user); saveDB(db);
@@ -190,21 +258,21 @@ app.patch('/api/me', requireAuth, async (req, res) => {
   const idx = db.users.findIndex(u => u.id === req.user.id);
   if (idx === -1) return res.status(404).json({ error: 'Not found' });
 
-  // Username uniqueness check on update
   if (req.body.username) {
     const taken = db.users.find(u => u.username === req.body.username.toLowerCase() && u.id !== req.user.id);
     if (taken) return res.status(400).json({ error: 'Username already taken' });
   }
 
-  ['displayName','color','status','username','avatar'].forEach(k => {
+  ['displayName','color','availability','username','avatar','role'].forEach(k => {
     if (req.body[k] !== undefined) db.users[idx][k] = req.body[k];
   });
+
   if (req.body.newPassword) {
     if (!req.body.currentPassword) return res.status(400).json({ error: 'Current password required' });
     if (!(await bcrypt.compare(req.body.currentPassword, db.users[idx].password)))
       return res.status(400).json({ error: 'Current password is incorrect' });
     if (!strongPassword(req.body.newPassword))
-      return res.status(400).json({ error: 'New password must be at least 8 characters with an uppercase letter, number, and special character' });
+      return res.status(400).json({ error: 'New password must be strong (8+ chars, uppercase, number, special char)' });
     db.users[idx].password = await bcrypt.hash(req.body.newPassword, 10);
   }
   saveDB(db);
@@ -215,14 +283,15 @@ app.patch('/api/me', requireAuth, async (req, res) => {
 app.get('/api/user/:username', requireAuth, (req, res) => {
   const user = loadDB().users.find(u => u.username === req.params.username.toLowerCase());
   if (!user) return res.status(404).json({ error: 'User not found' });
-  // Return only public info
-  res.json({ username: user.username, displayName: user.displayName, color: user.color, avatar: user.avatar, status: user.status });
+  res.json({ username: user.username, displayName: user.displayName, color: user.color, avatar: user.avatar, availability: user.availability, role: user.role, roomCode: user.roomCode });
 });
 
 // ── CONTACT REQUESTS ──────────────────────────────────
 app.get('/api/contact-requests', requireAuth, (req, res) => {
   const user = loadDB().users.find(u => u.id === req.user.id);
-  res.json(user?.contactRequests || []);
+  const received = user?.contactRequests || [];
+  const sent = user?.sentRequests || [];
+  res.json({ received, sent });
 });
 
 app.post('/api/contact-requests', requireAuth, (req, res) => {
@@ -238,27 +307,22 @@ app.post('/api/contact-requests', requireAuth, (req, res) => {
   if ((me.contacts || []).find(c => c.username === target.username))
     return res.status(400).json({ error: 'Already in your contacts' });
 
-  // Check for duplicate pending request
   target.contactRequests = target.contactRequests || [];
-  if (target.contactRequests.find(r => r.from === me.username && r.status === 'pending'))
+  me.sentRequests = me.sentRequests || [];
+
+  if (target.contactRequests.find(r => r.from === me.username))
     return res.status(400).json({ error: 'Request already sent' });
 
   const requestId = uuid();
-  target.contactRequests.push({
-    id: requestId, from: me.username,
-    displayName: me.displayName, avatar: me.avatar, color: me.color,
-    ts: Date.now(), status: 'pending'
-  });
+  const reqEntry = { id: requestId, from: me.username, displayName: me.displayName, avatar: me.avatar, color: me.color, ts: Date.now() };
+  target.contactRequests.push(reqEntry);
+  me.sentRequests.push({ id: requestId, to: target.username, displayName: target.displayName, avatar: target.avatar, color: target.color, ts: Date.now(), status: 'pending' });
   saveDB(db);
 
-  // Notify recipient via WS if online
+  // Notify recipient via WS
   const recipientWs = onlineUsers.get(target.username);
   if (recipientWs && recipientWs.readyState === 1) {
-    recipientWs.send(JSON.stringify({
-      type: 'contact-request',
-      id: requestId, from: me.username,
-      displayName: me.displayName, avatar: me.avatar, color: me.color
-    }));
+    recipientWs.send(JSON.stringify({ type: 'contact-request', ...reqEntry }));
   }
 
   res.json({ ok: true, id: requestId });
@@ -275,10 +339,7 @@ app.post('/api/contact-requests/:id/accept', requireAuth, (req, res) => {
   const senderIdx = db.users.findIndex(u => u.username === reqEntry.from);
   if (senderIdx === -1) return res.status(404).json({ error: 'Sender not found' });
 
-  // Add each to the other's contacts
-  const me = db.users[meIdx];
-  const sender = db.users[senderIdx];
-
+  const me = db.users[meIdx], sender = db.users[senderIdx];
   me.contacts = me.contacts || [];
   sender.contacts = sender.contacts || [];
 
@@ -287,17 +348,16 @@ app.post('/api/contact-requests/:id/accept', requireAuth, (req, res) => {
   if (!sender.contacts.find(c => c.username === me.username))
     sender.contacts.push({ username: me.username, displayName: me.displayName, color: me.color, avatar: me.avatar, addedAt: Date.now() });
 
-  // Remove the request
   db.users[meIdx].contactRequests = db.users[meIdx].contactRequests.filter(r => r.id !== req.params.id);
+
+  // Update sender's sentRequests status
+  sender.sentRequests = (sender.sentRequests || []).map(r => r.id === req.params.id ? { ...r, status: 'accepted' } : r);
   saveDB(db);
 
-  // Notify sender via WS
+  // Notify sender
   const senderWs = onlineUsers.get(sender.username);
   if (senderWs && senderWs.readyState === 1) {
-    senderWs.send(JSON.stringify({
-      type: 'contact-accepted',
-      username: me.username, displayName: me.displayName, color: me.color, avatar: me.avatar
-    }));
+    senderWs.send(JSON.stringify({ type: 'contact-accepted', username: me.username, displayName: me.displayName, color: me.color, avatar: me.avatar }));
   }
 
   res.json({ ok: true });
@@ -319,7 +379,7 @@ app.get('/api/contacts', requireAuth, (req, res) => {
   if (!user) return res.status(404).json({ error: 'Not found' });
   const contacts = (user.contacts || []).map(c => {
     const found = db.users.find(u => u.username === c.username);
-    return found ? { ...c, displayName: found.displayName, color: found.color, status: found.status, avatar: found.avatar } : c;
+    return found ? { ...c, displayName: found.displayName, color: found.color, availability: found.availability, avatar: found.avatar, role: found.role, roomCode: found.roomCode } : c;
   });
   res.json(contacts);
 });
@@ -331,7 +391,7 @@ app.delete('/api/contacts/:username', requireAuth, (req, res) => {
   saveDB(db); res.json({ ok: true });
 });
 
-// ── DIRECT MESSAGES ───────────────────────────────────
+// ── MESSAGES ─────────────────────────────────────────
 app.get('/api/messages/:username', requireAuth, (req, res) => {
   const db = loadDB();
   const me = db.users.find(u => u.id === req.user.id);
@@ -365,5 +425,5 @@ app.post('/api/recents/clear', requireAuth, (req, res) => {
 
 // ── START ─────────────────────────────────────────────
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`NexLink running on port ${PORT}`);
+  console.log(`Cadenza running on port ${PORT}`);
 });
